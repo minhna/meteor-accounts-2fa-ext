@@ -137,13 +137,13 @@ Meteor.methods({
   },
   async "2fa.addMethod"({
     method,
-    appName,
+    sendToken = true,
   }: {
     method: TwoFactorMethodData;
-    appName: string;
+    sendToken?: boolean;
   }) {
     // validate input
-    check(appName, String);
+    check(sendToken, Boolean);
     check(method, Object);
     check(method.type, String);
     check(method.value, String);
@@ -182,6 +182,10 @@ Meteor.methods({
       }
     );
 
+    if (!sendToken) {
+      return newMethod._id;
+    }
+
     // generate token
     const token = twofactor.generateToken(secret);
     if (!token) {
@@ -195,6 +199,8 @@ Meteor.methods({
     if (!sendTokenHandler) {
       throw new Error(`Unable to send token, Handler was not found`);
     }
-    return await sendTokenHandler.handler({ user, token: token.token, method });
+    await sendTokenHandler.handler({ user, token: token.token, method });
+
+    return newMethod._id;
   },
 });
