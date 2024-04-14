@@ -13,6 +13,7 @@ export type TwoFactorMethod = TwoFactorMethodData & {
   _id: string;
   secret: string;
   enabled: boolean;
+  lastUsedAt?: Date;
 };
 
 // register event listener on Accounts to handle sending 2fa tokens
@@ -21,19 +22,10 @@ Accounts.registerSend2FATokenHandler = function (type, handler) {
   this._send2FATokenHandlers.push({ type, handler });
 };
 
-const getSecret = (user: Meteor.User, method: TwoFactorMethodData) => {
-  if (!user.services?.twoFactorAuthentication) {
-    return;
-  }
-  const foundMethod = user.services.twoFactorAuthentication.methods?.find(
-    (m) => m.type === method.type && m.value === method.value
-  );
-  if (foundMethod) {
-    return foundMethod.secret;
-  }
-};
-
-const generateSecret = (methodData: TwoFactorMethodData, user: Meteor.User) => {
+export const generateSecret = (
+  methodData: TwoFactorMethodData,
+  user: Meteor.User
+) => {
   const name = `${methodData.type}-${methodData.value}`;
   const { secret } = twofactor.generateSecret({
     name,
@@ -42,16 +34,16 @@ const generateSecret = (methodData: TwoFactorMethodData, user: Meteor.User) => {
   return secret;
 };
 
-const checkToken = ({
+export const checkToken = ({
   token,
   user,
   methodId,
-  minutes,
+  windows = 2,
 }: {
   token: string;
   user: Meteor.User;
   methodId: string;
-  minutes?: number; // number of minutes
+  windows?: number; // number of windows to check. Each window is 30 seconds
 }) => {
   const method = user?.services?.twoFactorAuthentication?.methods?.find(
     (m) => m._id === methodId
@@ -63,7 +55,46 @@ const checkToken = ({
   if (!method.secret) {
     throw new Error(`Method was not installed correctly`);
   }
-  return twofactor.verifyToken(method.secret, token, minutes)?.delta === 0;
+  return twofactor.verifyToken(method.secret, token, windows) !== null;
+};
+
+export const sendToken = async ({
+  user,
+  method,
+  token,
+}: {
+  user: Meteor.User;
+  method: TwoFactorMethod;
+  token: string;
+}) => {
+  // send token, go through Accounts._send2FATokenHandlers and find the one with type equals method.type
+  const sendTokenHandler = Accounts._send2FATokenHandlers.find(
+    (item) => item.type === method.type
+  );
+  if (!sendTokenHandler) {
+    throw new Error(`Unable to send token, Handler was not found`);
+  }
+  const sent = await sendTokenHandler.handler({
+    user,
+    token,
+    method,
+  });
+  if (sent) {
+    // update method lastUsedAt
+    await Meteor.users.updateAsync(
+      {
+        _id: user._id,
+        "services.twoFactorAuthentication.methods._id": method._id,
+      },
+      {
+        $set: {
+          "services.twoFactorAuthentication.methods.$.lastUsedAt": new Date(),
+        },
+      }
+    );
+  }
+
+  return sent;
 };
 
 Meteor.methods({
@@ -137,13 +168,13 @@ Meteor.methods({
   },
   async "2fa.addMethod"({
     method,
-    sendToken = true,
+    send = true,
   }: {
     method: TwoFactorMethodData;
-    sendToken?: boolean;
+    send?: boolean;
   }) {
     // validate input
-    check(sendToken, Boolean);
+    check(send, Boolean);
     check(method, Object);
     check(method.type, String);
     check(method.value, String);
@@ -182,7 +213,7 @@ Meteor.methods({
       }
     );
 
-    if (!sendToken) {
+    if (!send) {
       return newMethod._id;
     }
 
@@ -192,15 +223,47 @@ Meteor.methods({
       throw new Error(`Unable to generate token`);
     }
 
-    // send token, go through Accounts._send2FATokenHandlers and find the one with type equals method.type
-    const sendTokenHandler = Accounts._send2FATokenHandlers.find(
-      (item) => item.type === method.type
-    );
-    if (!sendTokenHandler) {
-      throw new Error(`Unable to send token, Handler was not found`);
-    }
-    await sendTokenHandler.handler({ user, token: token.token, method });
+    await sendToken({ user, method: newMethod, token: token.token });
 
     return newMethod._id;
+  },
+  async "2fa.getEnabledMethods"() {
+    const user = Meteor.user();
+    if (!user) {
+      throw new Error(`User not logged in`);
+    }
+
+    const enableMethods =
+      user.services?.twoFactorAuthentication?.methods?.filter((m) => m.enabled);
+
+    // only return _id, type, and partially value
+    return enableMethods?.map((m) => ({
+      _id: m._id,
+      type: m.type,
+      value: m.value.slice(0, 3) + "*".repeat(m.value.length - 3),
+    }));
+  },
+  async "2fa.sendToken"({ methodId }: { methodId: string }) {
+    check(methodId, String);
+
+    const user = Meteor.user();
+    if (!user) {
+      throw new Error(`User not logged in`);
+    }
+
+    const method = user.services?.twoFactorAuthentication?.methods?.find(
+      (m) => m._id === methodId && m.enabled
+    );
+    if (!method) {
+      throw new Error(`Method not found`);
+    }
+
+    // TODO: check lastUsedAt, we may want to put a time limit between sending tokens
+    const token = twofactor.generateToken(method.secret);
+    if (!token) {
+      throw new Error(`Unable to generate token`);
+    }
+
+    return sendToken({ user, method, token: token.token });
   },
 });
